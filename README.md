@@ -1,4 +1,6 @@
-# LLM Economist
+# AI-Bazaar
+
+AI Bazaar: Extension of LLM Economist (https://github.com/sethkarten/LLM-Economist/), implementing agent-agent goods trading, firm agents, consumer agents, as well as visualization in Unity.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
