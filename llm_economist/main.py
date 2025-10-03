@@ -122,11 +122,13 @@ def run_simulation(args):
     
     start_time = time.time()
     
+    # ----------------------------------
     # Main simulation loop
     for k in range(args.max_timesteps):
+        input("Press Enter to continue to the next timestep...") if args.manual_step else None
         logger.info(f"TIMESTEP {k}")
         print(f"TIMESTEP {k}")
-        
+         
         wandb_logger = {}
         
         # Get new tax rates
@@ -156,12 +158,14 @@ def run_simulation(args):
                     else:
                         futures = [executor.submit(agent.act_vote, k) for agent in agents]
                         concurrent.futures.wait(futures)
+                        
                 votes_list = [agent.vote for agent in agents]
                 print("Votes: ", votes_list)
                 leader_agent = count_votes(votes_list)
                 leader = agents[leader_agent] # unnecessary
                 wandb_logger[f"leader"] = leader_agent
                 print("leader: ", leader_agent)
+                
                 if args.platforms:
                     for agent in agents:
                         agent.update_leader(k, leader_agent, candidates)
@@ -170,21 +174,25 @@ def run_simulation(args):
                     for agent in agents:
                         agent.update_leader(k, leader_agent)
                     tax_planner.update_leader(k, leader_agent)
+                    
                 # get tax rate
                 # get message from planner for agent features only
                 planner_state = tax_planner.get_state(k, workers_stats, True)
                 # find tax rate
                 tax_delta = agents[leader_agent].act_plan(k, planner_state)[0]
                 print("act_leader: ", tax_delta)
+                
                 for agent in agents:
                     agent.update_leader_action(k, tax_delta)
                 tax_planner.update_leader_action(k, tax_delta) # not necessary potentially with act_log_only, which format preferred?
                 tax_rates = tax_planner.act_log_only(tax_delta, k)
                 for agent in agents:
                     agent.tax_rates = tax_rates
+                    
             else:
                 tax_rates = tax_planner.act(k, workers_stats)
                 print("act: ", tax_rates)
+                
         elif args.planner_type == 'LLM':
             tax_planner.add_obs_msg(k, workers_stats)
             tax_planner.add_act_msg(k, tax_rates=tax_rates)
@@ -319,6 +327,9 @@ def create_argument_parser():
                     help='Elasticity values for tax brackets')
     parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--timeout', type=int, default=30, help='Timeout for LLM calls')
+    
+    parser.add_argument('--manual_step', type=bool, default=False, help='Use manual step through the simulation')
+    parser.add_argument('--log_thoughts', type=bool, default=False, help='Log agent thoughts')
     
     return parser
 

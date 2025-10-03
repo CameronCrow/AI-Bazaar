@@ -12,9 +12,10 @@ from .base import BaseLLMModel
 class GeminiModel(BaseLLMModel):
     """Gemini model implementation using Google's Gemini API."""
     
-    def __init__(self, model_name: str = "gemini-1.5-flash", 
+    def __init__(self, model_name: str = "gemini-2.5-flash", 
                  api_key: Optional[str] = None,
-                 max_tokens: int = 1000, temperature: float = 0.7):
+                 max_tokens: int = 1000, temperature: float = 0.7,
+                 project: Optional[str] = None, location: Optional[str] = None):
         """
         Initialize the Gemini model.
         
@@ -27,24 +28,42 @@ class GeminiModel(BaseLLMModel):
         super().__init__(model_name, max_tokens, temperature)
         
         # Get API key from parameter or environment
-        if api_key is None:
-            api_key = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+        api_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         
-        if not api_key:
-            raise ValueError("Google API key not found. Set GOOGLE_API_KEY environment variable or pass api_key parameter.")
+        self.model_name = model_name
         
-        self.api_key = api_key
-        
-        # Import Google AI SDK
-        try:
-            import google.generativeai as genai
+        if api_key:
+            # Do api_key setup
+            try:
+                import google.generativeai as genai
+            except ImportError as e:
+                raise ImportError("Please `pip install google-generativeai`") from e
             genai.configure(api_key=api_key)
+            self.api_key = api_key
             self.client = genai
-        except ImportError:
-            raise ImportError("Please install Google AI SDK: pip install google-generativeai")
-        
-        # Initialize the model
-        self.model = self.client.GenerativeModel(model_name)
+            self.model = self.client.GenerativeModel(self.model_name)
+            self.mode = "studio"  # for distinction between api_key and vertex ai setup
+        else:
+            # Do vertex ai setup
+            try:
+                from google import genai
+            except ImportError as e:
+                raise ImportError(
+                    "Vertex path needs `pip install google-genai` (new SDK)."
+                ) from e
+            _project = project or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            _location = location or os.environ.get("VERTEX_LOCATION", "us-central1")
+            if not _project:
+                raise ValueError(
+                    "Vertex AI requires GOOGLE_CLOUD_PROJECT set, "
+                    "and ADC via `gcloud auth application-default login` "
+                    "or GOOGLE_APPLICATION_CREDENTIALS."
+                )
+            self.genai = genai
+            self.client = genai.Client(vertexai=True, project=_project, location=_location)
+            self.mode = "vertexai"
+            
+        	
         
     def send_msg(self, system_prompt: str, user_prompt: str, 
                  temperature: Optional[float] = None, 
@@ -67,29 +86,42 @@ class GeminiModel(BaseLLMModel):
         retry_count = 0
         max_retries = 3
         
+        # Combine system and user prompts
+        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+        # Add JSON format instruction if requested
+        if json_format:
+            combined_prompt += "\n\nPlease respond in valid JSON format."        
+        
+
         while retry_count < max_retries:
             try:
-                # Combine system and user prompts
-                combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-                
-                # Add JSON format instruction if requested
-                if json_format:
-                    combined_prompt += "\n\nPlease respond in valid JSON format."
-                
-                # Configure generation parameters
-                generation_config = self.client.types.GenerationConfig(
-                    temperature=temperature,
-                    max_output_tokens=self.max_tokens,
-                    candidate_count=1
-                )
-                
-                # Generate response
-                response = self.model.generate_content(
-                    combined_prompt,
-                    generation_config=generation_config
-                )
-                
-                message = response.text
+                if self.mode == "studio":
+                    # Configure generation parameters
+                    generation_config = self.client.types.GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=self.max_tokens,
+                        candidate_count=1
+                    )
+                    # Generate response
+                    response = self.model.generate_content(
+                        combined_prompt,
+                        generation_config=generation_config
+                    )
+                    message = response.text
+                else: # vertex ai mode
+                    # Configure generation parameters
+                    config = {
+                        "temperature": temperature,
+                        "maxOutputTokens": self.max_tokens,
+                        "candidateCount": 1
+                    }
+                    # Generate response
+                    response = self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=combined_prompt,
+                        config=config
+                    )
+                    message = response.text
                 
                 if not self._validate_response(message):
                     self.logger.warning(f"Invalid response received: {message}")
@@ -108,7 +140,7 @@ class GeminiModel(BaseLLMModel):
                     self._handle_rate_limit(retry_count, max_retries)
                     retry_count += 1
                 else:
-                    self.logger.error(f"Error calling Gemini API: {e}")
+                    self.logger.error(f"Error calling Gemini: {e}")
                     retry_count += 1
                     if retry_count >= max_retries:
                         raise
@@ -120,6 +152,8 @@ class GeminiModel(BaseLLMModel):
     def get_available_models(cls):
         """Get list of available Gemini models."""
         return [
+        	"gemini-2.5-pro",
+            "gemini-2.5-flash",
             "gemini-1.5-pro",
             "gemini-1.5-flash",
             "gemini-1.0-pro",

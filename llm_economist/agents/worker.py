@@ -1,4 +1,5 @@
 import numpy as np
+from ..utils.common import Tuple
 from ..utils.common import Message
 from .llm_agent import LLMAgent
 import logging
@@ -427,12 +428,14 @@ class Worker(LLMAgent):
             
             system_prompt_backup = self.system_prompt
             self.system_prompt = ''
-            self.r = self.call_llm(role_reflect_msg, timestep, ['ANSWER'], self.parse_role_answer)
+            self.r, self.thought = self.call_llm(role_reflect_msg, timestep, ['ANSWER', 'thought'], self.parse_role_w_thought)
             self.system_prompt = system_prompt_backup
             self.adjusted_utility = self.utility * self.r
             self.utility_history.append(self.adjusted_utility)
             self.message_history[timestep]['metric'] = self.adjusted_utility
-
+            if args.log_thoughts:
+                # self.message_history[timestep]['thought'] = self.thought
+                self.logger.info(f'Thought: {self.thought}')
             self.message_history[timestep]['historical'] += f'isoelastic utility: u~ = z~ - c * l^d = {self.utility}\n'
             self.message_history[timestep]['historical'] += f'satisfaction: r = {self.r}\n'
             self.message_history[timestep]['historical'] += f'adjusted utility: u = r * u~ = {self.adjusted_utility}\n'
@@ -491,6 +494,24 @@ class Worker(LLMAgent):
             return 0.5
         else:
             raise ValueError('invalid answer', answer)
+        
+    def parse_role_w_thought(self, items: list[str]) -> Tuple[float, str]:
+        # Get role
+        if not isinstance(items[0], str):
+            raise ValueError('invalid answer', items)
+        answer = items[0].lower()
+        role = 0.0
+        if 'yes' in answer:
+            role = 1.0
+        elif 'no' in answer:
+            role = 0.5
+        else:
+            raise ValueError('invalid answer', answer)
+        
+        # Get thought
+        thought = items[1]
+        return role, thought
+        
 
     def parse_platform(self, items: list[str]) -> float:
         if not isinstance(items[0], list):
