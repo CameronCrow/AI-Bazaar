@@ -13,13 +13,15 @@ import random
 import numpy as np
 import time
 import threading
-import signal
+from typing import List
 from .utils.common import distribute_agents, count_votes, rGB2, GEN_ROLE_MESSAGES
 from .agents.worker import Worker, FixedWorker, distribute_personas
 from .agents.llm_agent import TestAgent
 from .agents.planner import TaxPlanner, FixedTaxPlanner
 from .utils.thread_manager import ThreadManager
 from .utils.thread_coordinator import create_thread_coordinator
+from .utils.conversation_thread import ConversationThread
+from .utils.input_interface import TkinterInputInterface
 
 
 def setup_logging(args):
@@ -33,7 +35,7 @@ def setup_logging(args):
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-
+    
 
 def run_simulation(args):
     """Run the main simulation."""
@@ -306,7 +308,7 @@ def run_main_simulation_loop(args, agents, tax_planner, logger, start_time, thre
     logger.info("Simulation completed successfully!")
 
 
-def run_with_threading(args, thread_manager):
+def run_with_threading(args, thread_manager, conversation_thread=None):
     """
     Run simulation with thread management.
     This function sets up Thread A and calls the main simulation loop.
@@ -377,6 +379,11 @@ def run_with_threading(args, thread_manager):
             else:
                 agent = FixedWorker(name, history_len=args.history_len, labor=np.random.randint(40, 61), args=args)
             agents.append(agent)
+        
+        # Setup conversation thread with agents
+        if conversation_thread is not None:
+            conversation_thread.set_available_workers(agents)
+        
         
         # Initialize tax planner
         if args.planner_type == 'LLM':
@@ -536,21 +543,32 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     
-    # Thread Manager
-    thread_manager = ThreadManager()
+    
     
     start_time = time.time()
     
     # GUI Coordinator (if requested)
     coordinator = None
     if args.gui_coordinator:
+        # Thread Manager
+        thread_manager = ThreadManager()
+        
+        # GUI for thread coordinator
         coordinator = create_thread_coordinator(thread_manager)
         print("GUI Thread Coordinator launched. Use the GUI to control threads.")
+        
+        
+        if args.enable_conversations:
+            input_interface = TkinterInputInterface()
+            conversation_thread = ConversationThread(thread_manager, input_interface, args)
+            conversation_thread.start_conversation_thread()
+        else:
+            conversation_thread = None
         
         # Start the simulation in a separate thread so GUI can run in main thread
         simulation_thread = threading.Thread(
             target=run_with_threading,
-            args=(args, thread_manager)
+            args=(args, thread_manager, conversation_thread)
         )
         simulation_thread.start()
         
