@@ -303,6 +303,7 @@ class Worker(LLMAgent):
             self.v = skill
         self.role = role
         self.utility_type = utility_type
+        self.args = args  # Store args as instance variable
 
         # voting
         self.leader = f"worker_{0}"
@@ -433,7 +434,7 @@ class Worker(LLMAgent):
             self.adjusted_utility = self.utility * self.r
             self.utility_history.append(self.adjusted_utility)
             self.message_history[timestep]['metric'] = self.adjusted_utility
-            if args.log_thoughts:
+            if self.args and self.args.log_thoughts:
                 # self.message_history[timestep]['thought'] = self.thought
                 self.logger.info(f'Thought: {self.thought}')
             self.message_history[timestep]['historical'] += f'isoelastic utility: u~ = z~ - c * l^d = {self.utility}\n'

@@ -12,10 +12,14 @@ import wandb
 import random
 import numpy as np
 import time
+import threading
+import signal
 from .utils.common import distribute_agents, count_votes, rGB2, GEN_ROLE_MESSAGES
 from .agents.worker import Worker, FixedWorker, distribute_personas
 from .agents.llm_agent import TestAgent
 from .agents.planner import TaxPlanner, FixedTaxPlanner
+from .utils.thread_manager import ThreadManager
+from .utils.thread_coordinator import create_thread_coordinator
 
 
 def setup_logging(args):
@@ -122,10 +126,56 @@ def run_simulation(args):
     
     start_time = time.time()
     
+    # Run the main simulation loop
+    run_main_simulation_loop(args, agents, tax_planner, logger, start_time)
+    
+    if args.wandb:
+        wandb.finish()
+
+
+def run_main_simulation_loop(args, agents, tax_planner, logger, start_time, thread_manager=None):
+    """
+    Main simulation loop that can run with or without thread management.
+    
+    Args:
+        args: Command line arguments
+        agents: List of agent objects
+        tax_planner: Tax planner object
+        logger: Logger instance
+        start_time: Simulation start time
+        thread_manager: Optional ThreadManager instance for Thread A coordination
+    """
     # ----------------------------------
     # Main simulation loop
     for k in range(args.max_timesteps):
-        input("Press Enter to continue to the next timestep...") if args.manual_step else None
+        # Handle manual step pause
+        if args.manual_step:
+            if thread_manager is not None:
+                # Pause Thread A after this timestep
+                thread_manager.pause_thread_a()
+                logger.info(f"Simulation paused at timestep {k}. Waiting for resume signal...")
+                print(f"\n[PAUSE] Simulation paused at timestep {k}")
+                print("[INFO] Thread A paused - waiting for resume signal...")
+                # Don't wait for input here - let external code handle resuming
+            else:
+                # Simple manual step without thread manager
+                logger.info(f"Manual step at timestep {k}. Waiting for input...")
+                print(f"\n[PAUSE] Manual step at timestep {k}")
+                print("[INFO] Press Enter to continue...")
+                input()
+                
+        # Check if Thread A is paused (if using thread manager)
+        if thread_manager is not None:
+            # Wait for Thread A to be running
+            while not thread_manager.stopped_a.is_set():
+                if thread_manager.running_a.wait(timeout=0.1):
+                    break  # Thread A is running, continue with simulation
+                # Thread A is paused, keep waiting
+            else:
+                # Thread A was stopped, exit simulation
+                logger.info("Simulation stopped by thread manager")
+                return
+            
         logger.info(f"TIMESTEP {k}")
         print(f"TIMESTEP {k}")
          
@@ -245,6 +295,7 @@ def run_simulation(args):
         fps = (k + 1) / iteration_time
         aps = total_actions / iteration_time
 
+        print(f"Timestep {k} completed in {iteration_time:.5f} seconds")
         logger.info(f"Time for iteration 0-{k+1}: {iteration_time:.5f} seconds")
         logger.info(f"FPS: {fps:.2f}")
         logger.info(f"APS: {aps:.2f}")
@@ -253,11 +304,136 @@ def run_simulation(args):
         logger.info(f"Time remaining {k+2}-{args.max_timesteps}: {remaining_time:.5f} seconds")
 
     logger.info("Simulation completed successfully!")
+
+
+def run_with_threading(args, thread_manager):
+    """
+    Run simulation with thread management.
+    This function sets up Thread A and calls the main simulation loop.
+    """
+    logger = logging.getLogger('main')
+    logger.info("Starting threaded execution")
     
-    if args.wandb:
-        wandb.finish()
+    try:
+        # Test LLM connectivity
+        if args.worker_type == 'LLM' or args.planner_type == 'LLM':
+            try:
+                TestAgent(args.llm, args.port, args)
+                logger.info(f"Successfully connected to LLM: {args.llm}")
+            except Exception as e:
+                logger.error(f"Failed to connect to LLM: {e}")
+                if args.worker_type == 'LLM' or args.planner_type == 'LLM':
+                    sys.exit(1)
+        
+        # Initialize skill distribution
+        if args.agent_mix == 'uniform':
+            skills = [-1] * args.num_agents  # maps to uniform distribution in worker.py
+        elif args.agent_mix == 'us_income':
+            # U.S. incomes to skill level (income level is at 40 hours per week)
+            skills = [float(x / 40) for x in rGB2(args.num_agents)] 
+            print(skills)
+            logger.info(f"Skills sampled from GB2 Distribution: {skills}")
+        else:
+            raise ValueError(f'Unknown agent mix: {args.agent_mix}')
+        
+        # Initialize agents
+        agents = []
+        personas = []
+        
+        if args.scenario == 'rational':
+            personas = ['default' for i in range(args.num_agents)]
+            utility_types = ['egotistical' for i in range(args.num_agents)]
+        elif args.scenario in ('bounded', 'democratic'):
+            # Generate personas
+            persona_data = distribute_personas(args.num_agents, args.llm, args.port, args.service)
+            global GEN_ROLE_MESSAGES
+            GEN_ROLE_MESSAGES.clear()
+            GEN_ROLE_MESSAGES.update(persona_data)
+            personas = list(GEN_ROLE_MESSAGES.keys())
+            
+            assert (args.percent_ego + args.percent_alt + args.percent_adv) == 100
+            utility_types = distribute_agents(args.num_agents, [args.percent_ego, args.percent_alt, args.percent_adv])
+            print('utility_types', utility_types)
+            logger.info(f"Utility Types: {utility_types}")
+        
+        # Create worker agents
+        for i in range(args.num_agents):
+            name = f"worker_{i}"
+            if args.worker_type == 'LLM' or (args.worker_type == 'ONE_LLM' and i == 0):
+                agent = Worker(args.llm, 
+                               args.port, 
+                               name, 
+                               utility_type=utility_types[i],
+                               history_len=args.history_len, 
+                               prompt_algo=args.prompt_algo, 
+                               max_timesteps=args.max_timesteps, 
+                               two_timescale=args.two_timescale,
+                               role=personas[i], 
+                               scenario=args.scenario, 
+                               num_agents=args.num_agents,
+                               args=args,
+                               skill=skills[i],
+                               )
+            else:
+                agent = FixedWorker(name, history_len=args.history_len, labor=np.random.randint(40, 61), args=args)
+            agents.append(agent)
+        
+        # Initialize tax planner
+        if args.planner_type == 'LLM':
+            planner_history = args.history_len
+            if args.num_agents > 20:
+                planner_history = args.history_len//(args.num_agents) * 20
+            
+            tax_planner = TaxPlanner(args.llm, args.port, 'Joe', 
+                                     history_len=planner_history, prompt_algo=args.prompt_algo, 
+                                     max_timesteps=args.max_timesteps, num_agents=args.num_agents, args=args)
+        elif args.planner_type in ['US_FED', 'SAEZ', 'SAEZ_FLAT', 'SAEZ_THREE', 'UNIFORM']:
+            tax_planner = FixedTaxPlanner('Joe', args.planner_type, history_len=args.history_len, skills=skills, args=args)
+        tax_rates = tax_planner.tax_rates
+        
+        # Initialize wandb logging
+        if args.wandb:
+            experiment_name = generate_experiment_name(args)
+            wandb.init(
+                project="llm-economist",
+                name=experiment_name,
+                config=vars(args)
+            )
+        
+        start_time = time.time()
+        
+        # Manual step coordination is now handled by GUI coordinator if enabled
+        if args.manual_step and not args.gui_coordinator:
+            logger.warning("Manual step mode requires GUI coordinator. Use --gui-coordinator flag.")
+        
+        # Start Thread A (simulation)
+        thread_manager.start_thread_a()
+        logger.info("Thread A started - simulation beginning")
+        
+        # Run the main simulation loop with thread manager
+        # The simulation loop will handle its own pausing/resuming via thread manager events
+        run_main_simulation_loop(args, agents, tax_planner, logger, start_time, thread_manager)
+        
+        # Stop Thread A when simulation completes
+        thread_manager.stop_thread_a()
+        logger.info("Simulation thread completed - Thread A stopped")
+        print("Simulation completed.")
+        
+        if args.wandb:
+            wandb.finish()
 
-
+        print("Returning from simulation thread")
+        return
+            
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, shutting down threads")
+        print("Simulation interrupted by user.")
+    except Exception as e:
+        logger.error(f"Error in threaded execution: {e}")
+        print(f"Simulation error: {e}")
+        
+    
+        
 def generate_experiment_name(args):
     """Generate a descriptive experiment name."""
     # Start with scenario and number of agents as base
@@ -328,8 +504,11 @@ def create_argument_parser():
     parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--timeout', type=int, default=30, help='Timeout for LLM calls')
     
-    parser.add_argument('--manual_step', type=bool, default=False, help='Use manual step through the simulation')
-    parser.add_argument('--log_thoughts', type=bool, default=False, help='Log agent thoughts')
+    parser.add_argument('--manual-step', action='store_true', help='Use manual step through the simulation')
+    parser.add_argument('--log-thoughts', action='store_true', help='Log agent thoughts')
+    
+    parser.add_argument('--enable-conversations', action='store_true', help='Enable agent conversations thread during simulation pauses')
+    parser.add_argument('--gui-coordinator', action='store_true', help='Launch GUI thread coordinator for manual thread control')
     
     return parser
 
@@ -357,13 +536,50 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     
+    # Thread Manager
+    thread_manager = ThreadManager()
+    
     start_time = time.time()
     
-    run_simulation(args)
+    # GUI Coordinator (if requested)
+    coordinator = None
+    if args.gui_coordinator:
+        coordinator = create_thread_coordinator(thread_manager)
+        print("GUI Thread Coordinator launched. Use the GUI to control threads.")
+        
+        # Start the simulation in a separate thread so GUI can run in main thread
+        simulation_thread = threading.Thread(
+            target=run_with_threading,
+            args=(args, thread_manager)
+        )
+        simulation_thread.start()
+        
+        # Show the GUI in a separate thread so main thread can continue
+        gui_thread = threading.Thread(
+            target=coordinator.show_gui,
+            daemon=True  # GUI thread can be daemon since we'll close it manually
+        )
+        gui_thread.start()
+        print("GUI thread started")
+        
+        # Wait for simulation thread to complete
+        print("Waiting for simulation thread to complete...\n")
+        simulation_thread.join()
+        print("Simulation thread joined successfully")
+        
+        # GUI thread is daemon, so it will be automatically terminated when main program exits
+        print("Simulation complete - GUI will close automatically")
+    else:
+        # Choose execution mode
+        if args.enable_conversations or args.manual_step:
+            run_with_threading(args, thread_manager)
+        else:
+            run_simulation(args)
     
     end_time = time.time()
-    print(f"Total simulation time: {end_time - start_time:.2f} seconds")
-
+    # print(f"Total simulation time: {end_time - start_time:.2f} seconds")
+    print(f"Total execution time: {end_time - start_time:.2f} seconds")
+    
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)

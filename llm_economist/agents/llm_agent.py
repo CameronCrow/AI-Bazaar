@@ -147,10 +147,55 @@ class LLMAgent:
                 parsed_keys.append(data[key])
             output = parse_func(parsed_keys)
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            self.logger.warning(f"JSON parsing failed (attempt {depth}): {str(e)}")
+            self.logger.warning(f"LLM output was: {repr(llm_output)}")
+            
             if depth <= self.timeout:
+                # Try to clean up the output before retrying
+                cleaned_output = self._clean_json_output(llm_output, keys)
+                if cleaned_output != llm_output:
+                    self.logger.info(f"Attempting to use cleaned output: {repr(cleaned_output)}")
+                    try:
+                        data = json.loads(cleaned_output)
+                        parsed_keys = []
+                        for key in keys:
+                            parsed_keys.append(data[key])
+                        output = parse_func(parsed_keys)
+                        return output
+                    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                        pass  # Fall through to retry
+                
                 return self.call_llm(msg, timestep, keys, parse_func, depth=depth+1, retry=True)
             else:
                 raise ValueError(f"Max recursion depth={depth} reached. Error parsing JSON: " + str(e))
+        return output
+    
+    def _clean_json_output(self, output: str, keys: list[str]) -> str:
+        """Try to clean up malformed JSON output from LLM."""
+        import re
+        
+        # Remove any text before the first {
+        output = re.sub(r'^[^{]*', '', output)
+        
+        # Remove any text after the last }
+        output = re.sub(r'}[^}]*$', '}', output)
+        
+        # Try to fix common issues
+        # Fix unterminated strings by adding closing quotes
+        if output.count('"') % 2 == 1:  # Odd number of quotes
+            output += '"'
+        
+        # Fix missing closing braces
+        open_braces = output.count('{')
+        close_braces = output.count('}')
+        if open_braces > close_braces:
+            output += '}' * (open_braces - close_braces)
+        
+        # Try to extract just the JSON part if there's extra text
+        json_match = re.search(r'\{.*\}', output, re.DOTALL)
+        if json_match:
+            output = json_match.group(0)
+        
         return output
     
     # prompting
